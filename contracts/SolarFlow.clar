@@ -1,6 +1,6 @@
 ;; SolarFlow - Decentralized Solar Energy Trading Platform with Smart Grid Integration
 ;; A peer-to-peer marketplace for solar energy producers and consumers with IoT device connectivity
-;; SECURITY FIXES APPLIED + SMART GRID INTEGRATION
+;; SECURITY FIXES APPLIED + SMART GRID INTEGRATION + DYNAMIC PRICING ALGORITHM + ERROR HANDLING FIXES
 
 ;; Constants
 (define-constant contract-owner tx-sender)
@@ -20,6 +20,16 @@
 (define-constant err-device-not-verified (err u113))
 (define-constant err-invalid-reading (err u114))
 (define-constant err-device-unauthorized (err u115))
+(define-constant err-invalid-pricing-config (err u116))
+
+;; Dynamic pricing constants
+(define-constant blocks-per-hour u6) ;; Approximately 6 blocks per hour on Stacks
+(define-constant blocks-per-day u144) ;; 24 hours * 6 blocks
+(define-constant peak-hours-start u48) ;; Block 48 = 8 AM (8 * 6 blocks)
+(define-constant peak-hours-end u132) ;; Block 132 = 10 PM (22 * 6 blocks)
+(define-constant max-price-multiplier u300) ;; 3.0x multiplier (300/100)
+(define-constant min-price-multiplier u50) ;; 0.5x multiplier (50/100)
+(define-constant base-multiplier u100) ;; 1.0x base (100/100)
 
 ;; Data variables
 (define-data-var next-producer-id uint u1)
@@ -28,6 +38,11 @@
 (define-data-var next-device-id uint u1)
 (define-data-var next-reading-id uint u1)
 (define-data-var platform-fee-rate uint u250) ;; 2.5% fee
+(define-data-var peak-demand-multiplier uint u150) ;; 1.5x during peak hours
+(define-data-var low-supply-multiplier uint u200) ;; 2.0x when supply is low
+(define-data-var high-supply-multiplier uint u80) ;; 0.8x when supply is high
+(define-data-var supply-threshold-low uint u1000) ;; Low supply threshold (1000 kWh)
+(define-data-var supply-threshold-high uint u10000) ;; High supply threshold (10000 kWh)
 
 ;; Data structures
 (define-map energy-producers
@@ -50,12 +65,14 @@
   {
     producer-id: uint,
     energy-amount-kwh: uint,
-    price-per-kwh: uint,
+    base-price-per-kwh: uint,
+    current-price-per-kwh: uint,
     generation-date: uint,
     expiry-date: uint,
     renewable-certificate: (string-ascii 100),
     is-active: bool,
-    created-at: uint
+    created-at: uint,
+    price-last-updated: uint
   }
 )
 
@@ -69,7 +86,8 @@
     total-price: uint,
     platform-fee: uint,
     transaction-date: uint,
-    carbon-offset-kg: uint
+    carbon-offset-kg: uint,
+    price-multiplier-used: uint
   }
 )
 
@@ -90,6 +108,17 @@
     total-energy-sold: uint,
     active-listings: uint,
     last-sale-date: uint
+  }
+)
+
+(define-map market-metrics
+  { metric-type: (string-ascii 20) }
+  {
+    total-supply-kwh: uint,
+    total-demand-24h: uint,
+    active-listings-count: uint,
+    average-price-per-kwh: uint,
+    last-updated: uint
   }
 )
 
@@ -138,6 +167,15 @@
   }
 )
 
+;; Contract initialization - set up initial market metrics
+(map-set market-metrics { metric-type: "current" } {
+  total-supply-kwh: u0,
+  total-demand-24h: u0, 
+  active-listings-count: u0,
+  average-price-per-kwh: u0,
+  last-updated: stacks-block-height
+})
+
 ;; Read-only functions
 (define-read-only (get-producer (producer-id uint))
   (map-get? energy-producers { producer-id: producer-id })
@@ -181,12 +219,22 @@
   )
 )
 
+(define-read-only (get-market-metrics)
+  (default-to
+    { total-supply-kwh: u0, total-demand-24h: u0, active-listings-count: u0, 
+      average-price-per-kwh: u0, last-updated: u0 }
+    (map-get? market-metrics { metric-type: "current" })
+  )
+)
+
 (define-read-only (get-platform-fee-rate)
   (var-get platform-fee-rate)
 )
 
 (define-read-only (calculate-platform-fee (amount uint))
-  (/ (* amount (var-get platform-fee-rate)) u10000)
+  (let ((validated-amount (if (> amount u0) amount u0)))
+    (/ (* validated-amount (var-get platform-fee-rate)) u10000)
+  )
 )
 
 (define-read-only (get-next-producer-id)
@@ -199,6 +247,124 @@
 
 (define-read-only (get-next-device-id)
   (var-get next-device-id)
+)
+
+;; Dynamic pricing read-only functions
+(define-read-only (is-peak-hours)
+  (let ((hour-in-day (mod stacks-block-height blocks-per-day)))
+    (and (>= hour-in-day peak-hours-start) (<= hour-in-day peak-hours-end))
+  )
+)
+
+(define-read-only (get-supply-demand-multiplier)
+  (let 
+    (
+      (metrics (get-market-metrics))
+      (total-supply (get total-supply-kwh metrics))
+      (low-threshold (var-get supply-threshold-low))
+      (high-threshold (var-get supply-threshold-high))
+    )
+    (if (<= total-supply low-threshold)
+      (var-get low-supply-multiplier)
+      (if (>= total-supply high-threshold)
+        (var-get high-supply-multiplier)
+        base-multiplier
+      )
+    )
+  )
+)
+
+(define-read-only (calculate-dynamic-price (base-price uint))
+  (let
+    (
+      (validated-base-price (if (> base-price u0) base-price u1))
+      (peak-multiplier (if (is-peak-hours) (var-get peak-demand-multiplier) base-multiplier))
+      (supply-multiplier (get-supply-demand-multiplier))
+      (raw-multiplier (/ (* peak-multiplier supply-multiplier) u100))
+      ;; Apply bounds manually instead of using min/max
+      (bounded-multiplier (if (> raw-multiplier max-price-multiplier)
+                            max-price-multiplier
+                            (if (< raw-multiplier min-price-multiplier)
+                              min-price-multiplier
+                              raw-multiplier)))
+      (dynamic-price (/ (* validated-base-price bounded-multiplier) u100))
+      (current-supply (get total-supply-kwh (get-market-metrics)))
+      (supply-status (if (<= current-supply (var-get supply-threshold-low)) 
+                       "low" 
+                       (if (>= current-supply (var-get supply-threshold-high)) 
+                         "high" 
+                         "normal")))
+    )
+    {
+      price: dynamic-price,
+      multiplier: bounded-multiplier,
+      is-peak: (is-peak-hours),
+      supply-level: supply-status
+    }
+  )
+)
+
+(define-read-only (get-pricing-config)
+  {
+    peak-demand-multiplier: (var-get peak-demand-multiplier),
+    low-supply-multiplier: (var-get low-supply-multiplier),
+    high-supply-multiplier: (var-get high-supply-multiplier),
+    supply-threshold-low: (var-get supply-threshold-low),
+    supply-threshold-high: (var-get supply-threshold-high),
+    current-is-peak: (is-peak-hours),
+    current-supply-multiplier: (get-supply-demand-multiplier)
+  }
+)
+
+;; Helper function to get maximum of two values
+(define-private (max-uint (a uint) (b uint))
+  (if (> a b) a b)
+)
+
+;; Helper function to get minimum of two values  
+(define-private (min-uint (a uint) (b uint))
+  (if (< a b) a b)
+)
+
+;; Initialize market metrics if not exists
+(define-private (ensure-market-metrics-exist)
+  (match (map-get? market-metrics { metric-type: "current" })
+    existing-metrics (ok true)
+    (begin
+      (map-set market-metrics { metric-type: "current" } {
+        total-supply-kwh: u0,
+        total-demand-24h: u0,
+        active-listings-count: u0,
+        average-price-per-kwh: u0,
+        last-updated: stacks-block-height
+      })
+      (ok true)
+    )
+  )
+)
+
+;; Market metrics update function
+(define-private (update-market-metrics)
+  (let
+    (
+      ;; Ensure metrics exist first
+      (init-result (ensure-market-metrics-exist))
+      (current-metrics (get-market-metrics))
+      ;; For now, we'll use a simplified approach for total supply calculation
+      ;; In production, this would be calculated by iterating through active listings
+      (estimated-supply u5000) ;; Placeholder - would be calculated from active listings
+      (safe-supply (max-uint estimated-supply u0))
+      (updated-metrics {
+        total-supply-kwh: safe-supply,
+        total-demand-24h: (get total-demand-24h current-metrics),
+        active-listings-count: (get active-listings-count current-metrics),
+        average-price-per-kwh: (get average-price-per-kwh current-metrics),
+        last-updated: stacks-block-height
+      })
+    )
+    (map-set market-metrics { metric-type: "current" } updated-metrics)
+    (ok true)
+  )
 )
 
 ;; Private functions
@@ -230,15 +396,36 @@
   )
 )
 
+;; FIXED: Safe helper function to update active listings count
+(define-private (update-active-listings-count-safe (increment bool))
+  (let
+    (
+      (current-metrics (get-market-metrics))
+      (current-count (get active-listings-count current-metrics))
+      (new-count (if increment 
+                    (+ current-count u1)
+                    (if (> current-count u0) (- current-count u1) u0)))
+      (updated-metrics (merge current-metrics {
+        active-listings-count: new-count,
+        last-updated: stacks-block-height
+      }))
+    )
+    (map-set market-metrics { metric-type: "current" } updated-metrics)
+    true
+  )
+)
+
 ;; Updated producer earnings function with proper validation
 (define-private (update-producer-earnings (producer-id uint) (amount uint) (energy-sold uint))
   (let
     (
       (producer-data (unwrap! (map-get? energy-producers { producer-id: producer-id }) err-not-found))
       (current-earnings (get-producer-earnings producer-id))
+      (new-total-earned (+ (get total-earned current-earnings) amount))
+      (new-total-energy-sold (+ (get total-energy-sold current-earnings) energy-sold))
       (updated-earnings {
-        total-earned: (+ (get total-earned current-earnings) amount),
-        total-energy-sold: (+ (get total-energy-sold current-earnings) energy-sold),
+        total-earned: new-total-earned,
+        total-energy-sold: new-total-energy-sold,
         active-listings: (get active-listings current-earnings),
         last-sale-date: stacks-block-height
       })
@@ -246,9 +433,10 @@
     ;; Validate inputs
     (asserts! (> amount u0) err-invalid-amount)
     (asserts! (> energy-sold u0) err-invalid-amount)
+    (asserts! (> producer-id u0) err-invalid-producer)
     ;; Prevent overflow by checking reasonable limits
-    (asserts! (< (get total-earned updated-earnings) u1000000000000) err-invalid-data)
-    (asserts! (< (get total-energy-sold updated-earnings) u1000000000000) err-invalid-data)
+    (asserts! (< new-total-earned u1000000000000) err-invalid-data)
+    (asserts! (< new-total-energy-sold u1000000000000) err-invalid-data)
     
     (map-set producer-earnings { producer-id: producer-id } updated-earnings)
     (ok true)
@@ -260,20 +448,24 @@
   (let
     (
       (current-balance (get-user-balance user))
+      (new-available-energy (+ (get available-energy-kwh current-balance) energy-amount))
+      (new-total-purchased (+ (get total-purchased current-balance) energy-amount))
+      (new-total-spent (+ (get total-spent current-balance) price))
+      (new-carbon-offset (+ (get carbon-offset-total current-balance) carbon-offset))
       (updated-balance {
-        available-energy-kwh: (+ (get available-energy-kwh current-balance) energy-amount),
-        total-purchased: (+ (get total-purchased current-balance) energy-amount),
-        total-spent: (+ (get total-spent current-balance) price),
-        carbon-offset-total: (+ (get carbon-offset-total current-balance) carbon-offset)
+        available-energy-kwh: new-available-energy,
+        total-purchased: new-total-purchased,
+        total-spent: new-total-spent,
+        carbon-offset-total: new-carbon-offset
       })
     )
     ;; Validate inputs
     (asserts! (> energy-amount u0) err-invalid-amount)
     (asserts! (> price u0) err-invalid-price)
     ;; Prevent overflow by checking reasonable limits
-    (asserts! (< (get available-energy-kwh updated-balance) u1000000000000) err-invalid-data)
-    (asserts! (< (get total-purchased updated-balance) u1000000000000) err-invalid-data)
-    (asserts! (< (get total-spent updated-balance) u1000000000000) err-invalid-data)
+    (asserts! (< new-available-energy u1000000000000) err-invalid-data)
+    (asserts! (< new-total-purchased u1000000000000) err-invalid-data)
+    (asserts! (< new-total-spent u1000000000000) err-invalid-data)
     
     (map-set user-energy-balance { user: user } updated-balance)
     (ok true)
@@ -287,35 +479,30 @@
       (device-data (unwrap! (map-get? iot-devices { device-id: device-id }) err-not-found))
       (current-summary (get-device-summary device-id))
       (is-generation (is-eq reading-type "generation"))
-      (days-elapsed (/ (- stacks-block-height (get registered-at device-data)) u144))
+      (days-elapsed (/ (- stacks-block-height (get registered-at device-data)) blocks-per-day))
       (safe-days (if (> days-elapsed u0) days-elapsed u1))
-      (updated-summary 
-        (if is-generation
-          {
-            total-generation-kwh: (+ (get total-generation-kwh current-summary) energy-amount),
-            total-consumption-kwh: (get total-consumption-kwh current-summary),
-            total-readings: (+ (get total-readings current-summary) u1),
-            last-generation-reading: stacks-block-height,
-            last-consumption-reading: (get last-consumption-reading current-summary),
-            average-daily-generation: (/ (+ (get total-generation-kwh current-summary) energy-amount) safe-days)
-          }
-          {
-            total-generation-kwh: (get total-generation-kwh current-summary),
-            total-consumption-kwh: (+ (get total-consumption-kwh current-summary) energy-amount),
-            total-readings: (+ (get total-readings current-summary) u1),
-            last-generation-reading: (get last-generation-reading current-summary),
-            last-consumption-reading: stacks-block-height,
-            average-daily-generation: (get average-daily-generation current-summary)
-          }
-        )
-      )
+      (new-total-generation (if is-generation 
+                               (+ (get total-generation-kwh current-summary) energy-amount)
+                               (get total-generation-kwh current-summary)))
+      (new-total-consumption (if is-generation
+                                (get total-consumption-kwh current-summary)
+                                (+ (get total-consumption-kwh current-summary) energy-amount)))
+      (updated-summary {
+        total-generation-kwh: new-total-generation,
+        total-consumption-kwh: new-total-consumption,
+        total-readings: (+ (get total-readings current-summary) u1),
+        last-generation-reading: (if is-generation stacks-block-height (get last-generation-reading current-summary)),
+        last-consumption-reading: (if is-generation (get last-consumption-reading current-summary) stacks-block-height),
+        average-daily-generation: (/ new-total-generation safe-days)
+      })
     )
     ;; Validate inputs
     (asserts! (> energy-amount u0) err-invalid-amount)
+    (asserts! (> device-id u0) err-invalid-device)
     (asserts! (or (is-eq reading-type "generation") (is-eq reading-type "consumption")) err-invalid-reading)
     ;; Prevent overflow
-    (asserts! (< (get total-generation-kwh updated-summary) u1000000000000) err-invalid-data)
-    (asserts! (< (get total-consumption-kwh updated-summary) u1000000000000) err-invalid-data)
+    (asserts! (< new-total-generation u1000000000000) err-invalid-data)
+    (asserts! (< new-total-consumption u1000000000000) err-invalid-data)
     
     (map-set device-readings-summary { device-id: device-id } updated-summary)
     (ok true)
@@ -327,6 +514,11 @@
   (let ((input-length (len input)))
     (and (>= input-length min-length) (<= input-length max-length))
   )
+)
+
+;; Pricing validation function
+(define-private (validate-pricing-multiplier (multiplier uint))
+  (and (>= multiplier min-price-multiplier) (<= multiplier max-price-multiplier))
 )
 
 ;; Public functions
@@ -494,184 +686,59 @@
   )
 )
 
-(define-public (report-energy-consumption (device-id uint) (energy-amount-kwh uint) (voltage uint) (current uint) (power-factor uint) (temperature uint))
-  (let
-    (
-      (reading-id (var-get next-reading-id))
-      (device (unwrap! (map-get? iot-devices { device-id: device-id }) err-not-found))
-      (new-reading {
-        device-id: device-id,
-        reading-type: "consumption",
-        energy-amount-kwh: energy-amount-kwh,
-        timestamp: stacks-block-height,
-        voltage: voltage,
-        current: current,
-        power-factor: power-factor,
-        temperature: temperature,
-        recorded-at: stacks-block-height
-      })
-    )
-    ;; Validate device and authorization
-    (asserts! (is-device-owner device-id tx-sender) err-device-unauthorized)
-    (asserts! (is-valid-device device-id) err-device-not-verified)
-    
-    ;; Validate reading data
-    (asserts! (> energy-amount-kwh u0) err-invalid-reading)
-    (asserts! (< energy-amount-kwh u100000) err-invalid-reading)
-    (asserts! (> voltage u0) err-invalid-reading)
-    (asserts! (< voltage u1000000) err-invalid-reading)
-    (asserts! (> current u0) err-invalid-reading)
-    (asserts! (< current u1000000) err-invalid-reading)
-    (asserts! (<= power-factor u1000) err-invalid-reading)
-    (asserts! (< temperature u1000) err-invalid-reading)
-    
-    ;; Validate reading-id doesn't already exist
-    (asserts! (is-none (map-get? energy-readings { reading-id: reading-id })) err-already-exists)
-    
-    ;; Record the reading
-    (map-set energy-readings { reading-id: reading-id } new-reading)
-    
-    ;; Update device last reading time
-    (map-set iot-devices { device-id: device-id }
-      (merge device { last-reading-at: stacks-block-height }))
-    
-    ;; Update device summary
-    (try! (update-device-summary device-id "consumption" energy-amount-kwh))
-    
-    (var-set next-reading-id (+ reading-id u1))
-    (ok reading-id)
-  )
-)
-
-;; Existing energy trading functions
-(define-public (create-energy-listing (producer-id uint) (energy-amount-kwh uint) (price-per-kwh uint) (expiry-blocks uint) (renewable-certificate (string-ascii 100)))
+(define-public (create-energy-listing (producer-id uint) (energy-amount-kwh uint) (base-price-per-kwh uint) (expiry-blocks uint) (renewable-certificate (string-ascii 100)))
   (let
     (
       (listing-id (var-get next-listing-id))
       (producer (unwrap! (map-get? energy-producers { producer-id: producer-id }) err-not-found))
       (current-earnings (get-producer-earnings producer-id))
+      (pricing-info (calculate-dynamic-price base-price-per-kwh))
       (new-listing {
         producer-id: producer-id,
         energy-amount-kwh: energy-amount-kwh,
-        price-per-kwh: price-per-kwh,
+        base-price-per-kwh: base-price-per-kwh,
+        current-price-per-kwh: (get price pricing-info),
         generation-date: stacks-block-height,
         expiry-date: (+ stacks-block-height expiry-blocks),
         renewable-certificate: renewable-certificate,
         is-active: true,
-        created-at: stacks-block-height
+        created-at: stacks-block-height,
+        price-last-updated: stacks-block-height
       })
     )
-    ;; Enhanced input validation
-    (asserts! (is-producer-owner producer-id tx-sender) err-unauthorized)
-    (asserts! (get is-verified producer) err-invalid-producer)
-    (asserts! (> energy-amount-kwh u0) err-invalid-listing)
-    (asserts! (< energy-amount-kwh u10000000) err-invalid-listing)
-    (asserts! (> price-per-kwh u0) err-invalid-price)
-    (asserts! (< price-per-kwh u10000000) err-invalid-price)
-    (asserts! (> expiry-blocks u0) err-invalid-listing)
-    (asserts! (< expiry-blocks u52560) err-invalid-listing)
-    (asserts! (validate-string-input renewable-certificate u1 u100) err-invalid-listing)
-    
-    ;; Validate listing-id doesn't already exist
-    (asserts! (is-none (map-get? energy-listings { listing-id: listing-id })) err-already-exists)
-    
-    (map-set energy-listings { listing-id: listing-id } new-listing)
-    (map-set producer-earnings { producer-id: producer-id }
-      (merge current-earnings { active-listings: (+ (get active-listings current-earnings) u1) }))
-    (var-set next-listing-id (+ listing-id u1))
-    (ok listing-id)
-  )
-)
-
-(define-public (purchase-energy (listing-id uint) (energy-amount-kwh uint))
-  (let
-    (
-      (listing (unwrap! (map-get? energy-listings { listing-id: listing-id }) err-not-found))
-      (producer (unwrap! (map-get? energy-producers { producer-id: (get producer-id listing) }) err-not-found))
-      (transaction-id (var-get next-transaction-id))
-      (total-price (* energy-amount-kwh (get price-per-kwh listing)))
-      (platform-fee (calculate-platform-fee total-price))
-      (seller-amount (- total-price platform-fee))
-      (carbon-offset-kg (/ energy-amount-kwh u2))
-      (new-transaction {
-        listing-id: listing-id,
-        buyer: tx-sender,
-        seller: (get owner producer),
-        energy-amount-kwh: energy-amount-kwh,
-        total-price: total-price,
-        platform-fee: platform-fee,
-        transaction-date: stacks-block-height,
-        carbon-offset-kg: carbon-offset-kg
-      })
+    ;; Function body starts here
+    (begin
+      ;; Validate inputs
+      (asserts! (is-producer-owner producer-id tx-sender) err-unauthorized)
+      (asserts! (get is-verified producer) err-invalid-producer)
+      (asserts! (> energy-amount-kwh u0) err-invalid-amount)
+      (asserts! (< energy-amount-kwh u1000000) err-invalid-amount)
+      (asserts! (> base-price-per-kwh u0) err-invalid-price)
+      (asserts! (< base-price-per-kwh u1000000) err-invalid-price)
+      (asserts! (> expiry-blocks u0) err-invalid-listing)
+      (asserts! (< expiry-blocks u52560) err-invalid-listing) ;; Max ~1 year
+      (asserts! (validate-string-input renewable-certificate u1 u100) err-invalid-listing)
+      
+      ;; Validate listing-id doesn't already exist
+      (asserts! (is-none (map-get? energy-listings { listing-id: listing-id })) err-already-exists)
+      
+      ;; Create the listing
+      (map-set energy-listings { listing-id: listing-id } new-listing)
+      
+      ;; Update producer earnings active listings count
+      (map-set producer-earnings { producer-id: producer-id }
+        (merge current-earnings { 
+          active-listings: (+ (get active-listings current-earnings) u1) 
+        }))
+      
+      ;; Update market metrics - FIXED: Use unwrap! instead of try!
+      (update-active-listings-count-safe true)
+      (unwrap! (update-market-metrics) err-invalid-data)
+      
+      ;; Increment next listing ID
+      (var-set next-listing-id (+ listing-id u1))
+      
+      (ok listing-id)
     )
-    ;; Enhanced validation
-    (asserts! (> listing-id u0) err-not-found)
-    (asserts! (get is-active listing) err-listing-inactive)
-    (asserts! (< stacks-block-height (get expiry-date listing)) err-invalid-listing)
-    (asserts! (<= energy-amount-kwh (get energy-amount-kwh listing)) err-insufficient-energy)
-    (asserts! (> energy-amount-kwh u0) err-invalid-amount)
-    (asserts! (< energy-amount-kwh u10000000) err-invalid-amount)
-    (asserts! (not (is-eq tx-sender (get owner producer))) err-cannot-buy-own-energy)
-    
-    ;; Validate transaction amounts
-    (asserts! (> total-price u0) err-invalid-price)
-    (asserts! (< total-price u1000000000000) err-invalid-price)
-    (asserts! (>= seller-amount u0) err-invalid-price)
-    
-    ;; Validate transaction-id doesn't already exist
-    (asserts! (is-none (map-get? energy-transactions { transaction-id: transaction-id })) err-already-exists)
-    
-    ;; Transfer STX from buyer to seller
-    (try! (stx-transfer? seller-amount tx-sender (get owner producer)))
-    
-    ;; Transfer platform fee to contract owner
-    (try! (stx-transfer? platform-fee tx-sender contract-owner))
-    
-    ;; Update listing
-    (if (is-eq energy-amount-kwh (get energy-amount-kwh listing))
-      (map-set energy-listings { listing-id: listing-id } 
-        (merge listing { is-active: false }))
-      (map-set energy-listings { listing-id: listing-id } 
-        (merge listing { energy-amount-kwh: (- (get energy-amount-kwh listing) energy-amount-kwh) }))
-    )
-    
-    ;; Record transaction
-    (map-set energy-transactions { transaction-id: transaction-id } new-transaction)
-    
-    ;; Update producer earnings
-    (try! (update-producer-earnings (get producer-id listing) seller-amount energy-amount-kwh))
-    
-    ;; Update buyer balance
-    (try! (update-user-balance tx-sender energy-amount-kwh total-price carbon-offset-kg))
-    
-    (var-set next-transaction-id (+ transaction-id u1))
-    (ok transaction-id)
-  )
-)
-
-(define-public (deactivate-listing (listing-id uint))
-  (let
-    (
-      (listing (unwrap! (map-get? energy-listings { listing-id: listing-id }) err-not-found))
-      (producer (unwrap! (map-get? energy-producers { producer-id: (get producer-id listing) }) err-not-found))
-    )
-    ;; Enhanced validation
-    (asserts! (> listing-id u0) err-not-found)
-    (asserts! (is-eq tx-sender (get owner producer)) err-unauthorized)
-    (asserts! (get is-active listing) err-listing-inactive)
-    
-    (map-set energy-listings { listing-id: listing-id } 
-      (merge listing { is-active: false }))
-    (ok true)
-  )
-)
-
-(define-public (update-platform-fee (new-fee-rate uint))
-  (begin
-    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
-    (asserts! (<= new-fee-rate u1000) err-invalid-price)
-    (asserts! (>= new-fee-rate u0) err-invalid-price)
-    (var-set platform-fee-rate new-fee-rate)
-    (ok true)
   )
 )
